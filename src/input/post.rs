@@ -104,6 +104,7 @@
 use Request;
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::error;
 use std::fmt;
 use std::io::BufRead;
@@ -643,6 +644,129 @@ macro_rules! post_input {
 
         go($request)
     });
+}
+
+// TODO: handle multiple values with the same name
+#[derive(Debug)]
+pub enum RawPostValue {
+    String(String),
+    File(BufferedFile),
+}
+impl RawPostValue {
+    pub fn decode<C, T: DecodePostField<C>>(&self, config: C) -> Result<T, PostFieldError> {
+        match self {
+            Self::String(s) => T::from_field(config, &s),
+            // TODO implement decoding RawPostValue::File
+            // Self::File(f) => T::from_file(config, f.data, f.filename, f.mime)
+            Self::File(f) => Err(PostFieldError::WrongFieldType)
+        }
+    }
+}
+impl DecodePostField<()> for RawPostValue {
+    fn from_field(_: (), content: &str) -> Result<Self, PostFieldError> {
+        Ok(Self::String(content.to_owned()))
+    }
+
+    fn from_file<R>(_: (), mut file: R, filename: Option<&str>, mime: &str)
+                    -> Result<Self, PostFieldError>
+        where R: BufRead
+    {
+        let mut out = Vec::new();
+        try!(file.read_to_end(&mut out));
+
+        Ok(Self::File(BufferedFile {
+            data: out,
+            mime: mime.to_owned(),
+            filename: filename.map(|n| n.to_owned()),
+        }))
+    }
+}
+
+pub fn to_hash_map(request: &Request) -> Result<HashMap<String, RawPostValue>, PostError> {
+    use std::io::Read;
+    use std::result::Result;
+    use crate::Request;
+    use crate::input::post::DecodePostField;
+    use crate::input::post::PostFieldError;
+    use crate::input::post::PostError;
+    use crate::input::post::form_urlencoded;
+    use crate::input::multipart;
+
+    let mut hashmap: HashMap<String, RawPostValue> = HashMap::new();
+    // TODO: handle if the same field is specified multiple times
+
+    if request.header("Content-Type").map(|ct| ct.starts_with("application/x-www-form-urlencoded")).unwrap_or(false) {
+        let body = {
+            // TODO: DDoSable server if body is too large?
+            let mut out = Vec::new();       // TODO: with_capacity()?
+            if let Some(mut b) = request.data() {
+                b.read_to_end(&mut out)?;
+            } else {
+                return Err(PostError::BodyAlreadyExtracted);
+            }
+            out
+        };
+
+        for (field, value) in form_urlencoded::parse(&body) {
+            let config = ();
+
+            let decoded = match DecodePostField::from_field(config, &value) {
+                Ok(d) => d,
+                Err(err) => return Err(PostError::Field {
+                    field: stringify!($field).into(),
+                    error: err,
+                }),
+            };
+
+            hashmap.insert(field.to_string(), decoded);
+        }
+
+    } else {
+        let mut multipart = match multipart::get_multipart_input(request) {
+            Ok(m) => m,
+            Err(multipart::MultipartError::WrongContentType) => {
+                return Err(PostError::WrongContentType);
+            },
+            Err(multipart::MultipartError::BodyAlreadyExtracted) => {
+                return Err(PostError::BodyAlreadyExtracted);
+            },
+        };
+
+        while let Some(mut multipart_entry) = multipart.next() {
+            let config = ();
+
+            if multipart_entry.is_text() {
+                let mut text = String::new();
+                multipart_entry.data.read_to_string(&mut text)?;
+                let decoded = match DecodePostField::from_field(config, &text) {
+                    Ok(d) => d,
+                    Err(err) => return Err(PostError::Field {
+                        field: stringify!($field).into(),
+                        error: err,
+                    }),
+                };
+                let field = multipart_entry.headers.name.as_ref();
+                hashmap.insert(field.to_string(), decoded);
+            } else {
+                let name = multipart_entry.headers.filename.as_ref().map(|n| n.to_owned());
+                let name = name.as_ref().map(|n| &n[..]);
+                let mime = multipart_entry.headers.content_type
+                    .map(|m| m.to_string())
+                    .unwrap_or_else(String::new);
+                let decoded = match DecodePostField::from_file(config, multipart_entry.data, name, &mime) {
+                    Ok(d) => d,
+                    Err(err) => return Err(PostError::Field {
+                        field: stringify!($field).into(),
+                        error: err,
+                    }),
+                };
+                let field = multipart_entry.headers.name.as_ref();
+                hashmap.insert(field.to_string(), decoded);
+            }
+            continue;
+        }
+    }
+    Ok(hashmap)
 }
 
 /// Attempts to decode the `POST` data received by the request.
