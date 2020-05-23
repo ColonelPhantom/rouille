@@ -735,7 +735,9 @@ pub fn to_hash_map(request: &Request) -> Result<HashMap<String, RawPostValue>, P
         while let Some(mut multipart_entry) = multipart.next() {
             let config = ();
 
-            if multipart_entry.is_text() {
+            if multipart_entry.headers.filename.is_none()
+                || multipart_entry.headers.content_type.is_none()
+            {
                 let mut text = String::new();
                 multipart_entry.data.read_to_string(&mut text)?;
                 let decoded = match DecodePostField::from_field(config, &text) {
